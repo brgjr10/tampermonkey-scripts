@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         4ndr0tools — GitHub Redesign (Violet Minimal)
 // @namespace    https://www.github.com/4ndr0666
-// @version      2.4.0
-// @description  Minimal, calmer GitHub. Flat dark neutrals, disciplined multi-color palette around a violet accent, cleaner repo/profile layout, card grid for repos/stars/search, simplified navbar, clutter hidden, and the dashboard changelog box replaced with a live GitHub Trending feed. Port of the old Stylus theme to Tampermonkey.
+// @version      2.5.1
+// @description  Minimal, calmer GitHub. Flat dark neutrals, disciplined multi-color palette around a violet accent, cleaner repo/profile layout, card grid for repos/stars/search, simplified navbar, clutter hidden, and the dashboard changelog box replaced with a live GitHub Trending feed. Port of the old Stylus theme to Tampermonkey. Adds starred repo list labels.
 // @author       4ndr0666
 // @license      CC0-1.0
 // @match        https://github.com/*
 // @match        https://gist.github.com/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
+// @connect      github.com
 // @connect      mshibanami.github.io
 // ==/UserScript==
 
@@ -53,12 +54,12 @@
                  'changelog' -> replace the "Latest from our changelog" box.
      ============================================================ */
   const TRENDING = {
-    enabled:   true,
-    period:    'daily',
-    language:  'all',
-    maxItems:  8,
-    title:     'Trending on GitHub',
-    cacheTTL:  60 * 60 * 1000, // 1 hour
+    enabled: true,
+    period: 'daily',
+    language: 'all',
+    maxItems: 8,
+    title: 'Trending on GitHub',
+    cacheTTL: 60 * 60 * 1000, // 1 hour
     placement: 'sidebar',      // 'sidebar' | 'changelog'
   };
 
@@ -597,6 +598,41 @@
   .x-trending__foot a:hover { color: var(--x-accent-hover) !important; }
   .x-trending__status { color: var(--x-text-faint) !important; font-size: 12px; padding: 8px 0; }
 
+  /* ===================== STARRED REPO LIST BADGES ===================== */
+  .x-star-list-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    margin-left: 8px;
+    font-size: 11px;
+    font-weight: 500;
+    border-radius: 999px;
+    background: var(--x-accent-soft) !important;
+    color: var(--x-accent-hover) !important;
+    border: 1px solid transparent;
+    white-space: nowrap;
+    line-height: 1;
+  }
+  .x-star-list-badge:hover {
+    border-color: var(--x-accent) !important;
+  }
+  .x-star-list-badge .octicon {
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+  }
+  .x-badge-emoji {
+    font-size: 12px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .x-star-list-badge.multiple::after {
+    content: ' +' attr(data-count) ' more';
+    font-size: 10px;
+    opacity: 0.8;
+  }
+
   /* Standalone card when the feed lives in the sidebar aside. */
   .x-trending-card {
     max-width: 356px;
@@ -698,7 +734,7 @@
             return;
           }
         }
-      } catch (_) {}
+      } catch (_) { }
 
       GM_xmlhttpRequest({
         method: 'GET',
@@ -710,7 +746,7 @@
             }
             const items = parseFeed(res.responseText);
             if (!items.length) throw new Error('no items');
-            try { localStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), items })); } catch (_) {}
+            try { localStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), items })); } catch (_) { }
             resolve(items);
           } catch (e) { reject(e); }
         },
@@ -810,5 +846,488 @@
       watchDashboard();
     }
     document.addEventListener('turbo:load', watchDashboard);
+  }
+
+  /* ============================================================
+     STARRED REPO LIST LABELS
+     On /user?tab=stars pages, fetch the user's starred lists and
+     show which list(s) each repo belongs to.
+     ============================================================ */
+
+  // Config for starred lists feature
+  const STAR_LISTS = {
+    enabled: true,
+    maxListsPerRepo: 2,        // show up to N list badges, then "+N more"
+    cacheTTL: 30 * 60 * 1000,  // 30 minutes (longer cache)
+  };
+
+// Check if we're on a stars page (own or other user's)
+  function isStarsPage() {
+    // Check URL patterns (pathname + search)
+    const urlMatch = (location.pathname + location.search).match(/^\/[^/]+\?tab=stars($|&)/) ||
+           location.pathname.match(/^\/[^/]+\/stars\//) ||
+           location.pathname.match(/^\/stars\/[^/]+\/lists\//);
+    
+    // Also check if the stars tab is currently active in the UI
+    // Selected tab has class "selected" and/or aria-current="page"
+    const tabMatch = document.querySelector('.UnderlineNav-item[data-tab-item="stars"].selected, .UnderlineNav-item[data-tab-item="stars"][aria-current="page"]');
+    
+    const result = urlMatch || tabMatch;
+    console.log('[GitHub Redesign] isStarsPage check:', location.pathname + location.search, 'urlMatch:', !!urlMatch, 'tabMatch:', !!tabMatch, '->', !!result);
+    return result;
+  }
+
+  // Extract username from the stars page URL
+  function getStarsUsername() {
+    const m = location.pathname.match(/^\/([^/]+)/);
+    return m ? m[1] : null;
+  }
+
+  // Fetch all starred lists for a user from the sidebar
+  async function fetchUserStarredLists(username) {
+    const cacheKey = `x-star-lists:${username}`;
+    try {
+      const raw = localStorage.getItem(cacheKey);
+      if (raw) {
+        const c = JSON.parse(raw);
+        // Check version for cache invalidation when structure changes
+        if (c.version === 3 && Date.now() - c.t < STAR_LISTS.cacheTTL && c.lists?.length) {
+          console.log('[GitHub Redesign] Using cached starred lists:', c.lists.map(l => `${l.name}${l.emoji ? ' ' + l.emoji : ''}`));
+          return c.lists;
+        }
+      }
+    } catch (_) { }
+
+    // Scrape the lists from the stars page sidebar
+    // The lists are in #profile-lists-container a[href*="/lists/"]
+    return new Promise((resolve) => {
+      // We need to fetch the stars page HTML to get the list links
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: `https://github.com/${username}?tab=stars`,
+        onload: (res) => {
+          try {
+            if (res.status < 200 || res.status >= 300) throw new Error('HTTP ' + res.status);
+            const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
+            const listLinks = doc.querySelectorAll('#profile-lists-container a[href*="/lists/"]');
+            const lists = Array.from(listLinks).map((a) => {
+              const href = a.getAttribute('href');
+              const nameMatch = href.match(/\/lists\/([^/]+)$/);
+              // Try to find emoji in the list item (may be in a child element)
+              const emojiEl = a.querySelector('.emoji, [class*="emoji"], .octicon');
+              let emoji = '';
+              if (emojiEl) {
+                // If it's an octicon, we'll use a fallback
+                if (emojiEl.classList.contains('octicon')) {
+                  emoji = ''; // We'll use octicon fallback in badge
+                } else {
+                  emoji = emojiEl.textContent?.trim() || '';
+                }
+              }
+              return {
+                name: nameMatch ? nameMatch[1] : 'unknown',
+                url: href,
+                fullUrl: `https://github.com${href}`,
+                emoji: emoji || null,
+              };
+            }).filter((l) => l.name);
+            console.log('[GitHub Redesign] Found starred lists:', lists.map(l => `${l.name}${l.emoji ? ' ' + l.emoji : ''}`));
+            try {
+              localStorage.setItem(cacheKey, JSON.stringify({ t: Date.now(), lists, version: 3 }));
+            } catch (_) { }
+            resolve(lists);
+          } catch (e) {
+            console.warn('[GitHub Redesign] Failed to parse starred lists:', e);
+            resolve([]);
+          }
+        },
+        onerror: () => resolve([]),
+        ontimeout: () => resolve([]),
+        timeout: 15000,
+      });
+    });
+  }
+
+  // Fetch emoji for a list from its page (GitHub lists can have custom emojis)
+  async function fetchListEmoji(listUrl) {
+    const cacheKey = `x-star-list-emoji:${listUrl}`;
+    try {
+      const raw = localStorage.getItem(cacheKey);
+      if (raw) {
+        const c = JSON.parse(raw);
+        if (Date.now() - c.t < STAR_LISTS.cacheTTL && c.emoji) {
+          return c.emoji;
+        }
+      }
+    } catch (_) {}
+
+    return new Promise((resolve) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: listUrl,
+        onload: (res) => {
+          try {
+            if (res.status < 200 || res.status >= 300) throw new Error('HTTP ' + res.status);
+            const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
+            
+            // Extract emoji from og:title meta tag (format: "username's list / 😎 List Name")
+            let emoji = '';
+            const ogTitle = doc.querySelector('meta[property="og:title"]')?.getAttribute('content');
+            if (ogTitle) {
+              // Decode HTML entities
+              const decoded = ogTitle.replace(/'/g, "'").replace(/&/g, '&');
+              // Match emoji before the list name (after " / ")
+              const match = decoded.match(/\/ ([^a-zA-Z0-9\s].*?) [A-Z]/);
+              if (match) {
+                emoji = match[1].trim();
+              }
+            }
+            
+            // Fallback: check for emoji in header elements
+            if (!emoji) {
+              const emojiSelectors = [
+                'h1 .emoji',
+                '.list-header .emoji',
+                '[data-list-emoji]',
+                '.Box-header .emoji',
+              ];
+              for (const sel of emojiSelectors) {
+                const el = doc.querySelector(sel);
+                if (el) {
+                  emoji = el.textContent?.trim() || '';
+                  break;
+                }
+              }
+            }
+            
+            try {
+              localStorage.setItem(cacheKey, JSON.stringify({ t: Date.now(), emoji: emoji || null }));
+            } catch (_) {}
+            resolve(emoji || null);
+          } catch (e) {
+            console.warn('[GitHub Redesign] Failed to fetch list emoji:', e);
+            resolve(null);
+          }
+        },
+        onerror: () => resolve(null),
+        ontimeout: () => resolve(null),
+        timeout: 15000,
+      });
+    });
+  }
+
+  // Fetch repositories in a specific starred list
+  async function fetchListRepos(listUrl) {
+    const cacheKey = `x-star-list-repos:${listUrl}`;
+    try {
+      const raw = localStorage.getItem(cacheKey);
+      if (raw) {
+        const c = JSON.parse(raw);
+        if (Date.now() - c.t < STAR_LISTS.cacheTTL && c.repos?.length) {
+          return c.repos;
+        }
+      }
+    } catch (_) { }
+
+    return new Promise((resolve) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: listUrl,
+        onload: (res) => {
+          try {
+            if (res.status < 200 || res.status >= 300) throw new Error('HTTP ' + res.status);
+            const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
+            // List pages have repo items in the main content area
+            // Look for links in the list content (not nav)
+            const mainContent = doc.querySelector('main') || doc.querySelector('#main') || doc.querySelector('.Layout-main') || doc;
+            const repos = Array.from(mainContent.querySelectorAll('a[href^="/"]')).map((a) => {
+              const href = a.getAttribute('href');
+              // Match /owner/repo pattern (not /stars/... or /user/... or /settings/...)
+              const m = href.match(/^\/([^/]+)\/([^/]+)$/);
+              if (m && !href.includes('/stars/') && !href.includes('/lists/') && !href.includes('/settings/') && !href.includes('/orgs/')) {
+                return `${m[1]}/${m[2]}`;
+              }
+              return null;
+            }).filter(Boolean);
+            // Deduplicate
+            const uniqueRepos = [...new Set(repos)];
+            console.log(`[GitHub Redesign] List ${listUrl} -> ${uniqueRepos.length} repos:`, uniqueRepos.slice(0, 5));
+            try {
+              localStorage.setItem(cacheKey, JSON.stringify({ t: Date.now(), repos: uniqueRepos }));
+            } catch (_) { }
+            resolve(uniqueRepos);
+          } catch (e) {
+            console.warn('[GitHub Redesign] Failed to parse list repos:', e);
+            resolve([]);
+          }
+        },
+        onerror: () => resolve([]),
+        ontimeout: () => resolve([]),
+        timeout: 15000,
+      });
+    });
+  }
+
+  // Build a map of repo full_name -> list names (with emojis)
+  async function buildRepoListMap(username) {
+    const lists = await fetchUserStarredLists(username);
+    if (!lists.length) return new Map();
+
+    const repoToLists = new Map();
+
+    // Fetch repos and emojis for each list in parallel
+    const listPromises = lists.map(async (list) => {
+      const [repos, emoji] = await Promise.all([
+        fetchListRepos(list.fullUrl),
+        fetchListEmoji(list.fullUrl),
+      ]);
+      return { listName: list.name, repos, emoji: emoji || list.emoji };
+    });
+
+    const results = await Promise.all(listPromises);
+
+    for (const { listName, repos, emoji } of results) {
+      for (const repoFullName of repos) {
+        if (!repoToLists.has(repoFullName)) {
+          repoToLists.set(repoFullName, []);
+        }
+        repoToLists.get(repoFullName).push({ name: listName, emoji });
+      }
+    }
+
+    return repoToLists;
+  }
+
+  // Create a list badge element
+  function createListBadge(listName, emoji, isMultiple, extraCount) {
+    const span = document.createElement('span');
+    span.className = 'x-star-list-badge' + (isMultiple ? ' multiple' : '');
+    if (isMultiple) span.dataset.count = extraCount;
+    
+    const emojiHtml = emoji ? `<span class="x-badge-emoji">${emoji}</span> ` : 
+      `<svg class="octicon" aria-hidden="true" viewBox="0 0 16 16" width="12" height="12">
+         <path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 00-.25.25v11.5c0 .138.112.25.25.25h8.5a.25.25 0 00.25-.25v-7.5a.75.75 0 00-1.5 0v7.5h-8.5v-11.5a.25.25 0 00-.25-.25h-8.5zM8.5 1h-6a1.5 1.5 0 00-1.5 1.5v10A1.5 1.5 0 012.5 14h9a1.5 1.5 0 001.5-1.5v-10A1.5 1.5 0 018.5 1z"/>
+       </svg> `;
+    
+    span.innerHTML = `${emojiHtml}${listName}`;
+    return span;
+  }
+
+  // Apply list badges to repo items on the stars page
+  function applyStarListBadges(repoToLists) {
+    if (!repoToLists.size) return;
+
+    const frame = document.getElementById('user-starred-repos');
+    const searchRoot = frame || document;
+    const repoItems = searchRoot.querySelectorAll('.col-12.d-block.width-full.tmp-py-4, .Box-row');
+
+    let updated = 0;
+
+    for (const item of repoItems) {
+      // Find the repo link to get the full name
+      const repoLink = item.querySelector('h3 a[href^="/"]');
+      if (!repoLink) continue;
+
+      const href = repoLink.getAttribute('href');
+      const m = href.match(/^\/([^/]+)\/([^/]+)$/);
+      if (!m) continue;
+
+      const repoFullName = `${m[1]}/${m[2]}`;
+      const lists = repoToLists.get(repoFullName);
+      if (!lists?.length) continue;
+
+      // Find where to insert the badge (after the repo name, before description)
+      const nameContainer = item.querySelector('h3') || item.querySelector('.d-inline-block.mb-1');
+      if (!nameContainer) continue;
+
+      // Check if already added
+      if (nameContainer.querySelector('.x-star-list-badge')) continue;
+
+      const maxShow = STAR_LISTS.maxListsPerRepo;
+      const showLists = lists.slice(0, maxShow);
+      const extraCount = lists.length - maxShow;
+
+      const badgeContainer = document.createElement('span');
+      badgeContainer.style.display = 'inline-flex';
+      badgeContainer.style.gap = '4px';
+      badgeContainer.style.flexWrap = 'wrap';
+      badgeContainer.style.marginLeft = '8px';
+
+      for (const listObj of showLists) {
+        badgeContainer.appendChild(createListBadge(listObj.name, listObj.emoji, false, 0));
+      }
+      if (extraCount > 0) {
+        badgeContainer.appendChild(createListBadge('more', null, true, extraCount));
+      }
+
+      nameContainer.appendChild(badgeContainer);
+      updated++;
+    }
+
+    if (updated) {
+      console.log(`[GitHub Redesign] Added list badges to ${updated} starred repos`);
+    }
+  }
+
+  // Main function to load and apply starred list data
+  async function loadStarredLists(bypassPageCheck = false) {
+    if (!STAR_LISTS.enabled) return;
+    if (!bypassPageCheck && !isStarsPage()) return;
+
+    const username = getStarsUsername();
+    if (!username) return;
+
+    // Avoid duplicate runs for same username
+    if (document.body.dataset.xStarListsLoaded === username) return;
+    document.body.dataset.xStarListsLoaded = username;
+
+    // Wait for the turbo-frame content to be present
+    await waitForStarredRepos();
+
+    try {
+      const repoToLists = await buildRepoListMap(username);
+      applyStarListBadges(repoToLists);
+    } catch (e) {
+      console.warn('[GitHub Redesign] Failed to load starred lists:', e);
+    }
+  }
+
+  // Wait for starred repo items to appear in the turbo-frame
+  function waitForStarredRepos(timeout = 10000) {
+    return new Promise((resolve) => {
+      const frame = document.getElementById('user-starred-repos');
+      if (!frame) {
+        resolve();
+        return;
+      }
+
+      // Check if content already loaded
+      const checkContent = () => {
+        const items = frame.querySelectorAll('.col-12.d-block.width-full.tmp-py-4, .Box-row');
+        if (items.length > 0) return true;
+        return false;
+      };
+
+      if (checkContent()) {
+        resolve();
+        return;
+      }
+
+      // Watch for turbo-frame load
+      const onFrameLoad = () => {
+        if (checkContent()) {
+          frame.removeEventListener('load', onFrameLoad);
+          resolve();
+        }
+      };
+      frame.addEventListener('load', onFrameLoad);
+
+      // Fallback: MutationObserver
+      const obs = new MutationObserver(() => {
+        if (checkContent()) {
+          obs.disconnect();
+          frame.removeEventListener('load', onFrameLoad);
+          resolve();
+        }
+      });
+      obs.observe(frame, { childList: true, subtree: true });
+
+      // Timeout fallback
+      setTimeout(() => {
+        obs.disconnect();
+        frame.removeEventListener('load', onFrameLoad);
+        resolve();
+      }, timeout);
+    });
+  }
+
+  // Run on page load and on Turbo navigation
+  function watchStarredLists() {
+    if (!STAR_LISTS.enabled) return;
+    if (!isStarsPage()) return;
+    loadStarredLists();
+  }
+
+  // Also watch for tab switches to Stars via Turbo
+  function watchTabSwitches() {
+    // Listen for turbo-frame loads (Stars tab content)
+    document.addEventListener('turbo:frame-load', (e) => {
+      if (e.target.id === 'user-starred-repos') {
+        document.body.dataset.xStarListsLoaded = '';
+        loadStarredLists(true);
+      }
+    });
+
+    // Listen for turbo:load (full page PJAX navigation)
+    document.addEventListener('turbo:load', () => {
+      if (isStarsPage()) {
+        document.body.dataset.xStarListsLoaded = '';
+        loadStarredLists(true);
+      }
+    });
+
+    // Listen for tab clicks on the Stars nav item
+    document.addEventListener('click', (e) => {
+      const starsTab = e.target.closest('[data-tab-item="stars"], [href*="tab=stars"]');
+      if (starsTab) {
+        setTimeout(() => {
+          document.body.dataset.xStarListsLoaded = '';
+          loadStarredLists(true);
+        }, 100);
+      }
+    });
+
+    // Fallback: MutationObserver to detect when starred repo content appears
+    const starsFrame = document.getElementById('user-starred-repos');
+    if (starsFrame) {
+      const observer = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.type === 'childList' && m.addedNodes.length > 0) {
+            // Check if repo items were added
+            const hasRepos = starsFrame.querySelector('.col-12.d-block.width-full.tmp-py-4, .Box-row');
+            if (hasRepos && !document.body.dataset.xStarListsLoaded) {
+              document.body.dataset.xStarListsLoaded = '';
+              loadStarredLists(true);
+              observer.disconnect();
+              break;
+            }
+          }
+        }
+      });
+      observer.observe(starsFrame, { childList: true, subtree: true });
+      
+      // Cleanup after 30 seconds
+      setTimeout(() => observer.disconnect(), 30000);
+    }
+  }
+
+  // Debug: expose functions to window for console access
+  window.__githubRedesign = {
+    loadStarredLists: () => loadStarredLists(true),
+    clearStarCache: () => {
+      const username = getStarsUsername();
+      localStorage.removeItem(`x-star-lists:${username}`);
+      Object.keys(localStorage).forEach(key => {
+        if (key.startsWith('x-star-list-repos:') || key.startsWith('x-star-list-emoji:')) {
+          localStorage.removeItem(key);
+        }
+      });
+      console.log('[GitHub Redesign] Star cache cleared');
+    },
+    getStarCache: () => {
+      const username = getStarsUsername();
+      return JSON.parse(localStorage.getItem(`x-star-lists:${username}`) || 'null');
+    },
+  };
+  console.log('[GitHub Redesign] Debug commands: __githubRedesign.loadStarredLists(), .clearStarCache(), .getStarCache()');
+
+  if (STAR_LISTS.enabled) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', watchStarredLists);
+    } else {
+      watchStarredLists();
+    }
+    document.addEventListener('turbo:load', watchStarredLists);
+    watchTabSwitches();
   }
 })();
