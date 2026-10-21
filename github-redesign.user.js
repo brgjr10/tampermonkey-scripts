@@ -1347,7 +1347,6 @@
     const labels = [];
     const data = [];
     days.forEach((el) => {
-      if (labels.length >= 28) { labels.shift(); data.shift(); }
       labels.push(el.getAttribute('data-date'));
       const tipId = el.getAttribute('aria-labelledby');
       const tip = tipId ? document.getElementById(tipId) : null;
