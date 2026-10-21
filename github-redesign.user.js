@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         4ndr0tools — GitHub Redesign (Violet Minimal)
 // @namespace    https://www.github.com/4ndr0666
-// @version      2.5.1
+// @version      2.6.0
 // @description  Minimal, calmer GitHub. Flat dark neutrals, disciplined multi-color palette around a violet accent, cleaner repo/profile layout, card grid for repos/stars/search, simplified navbar, clutter hidden, and the dashboard changelog box replaced with a live GitHub Trending feed. Port of the old Stylus theme to Tampermonkey. Adds starred repo list labels.
 // @author       4ndr0666
 // @license      CC0-1.0
@@ -9,6 +9,7 @@
 // @match        https://gist.github.com/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
+// @require      https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js
 // @connect      github.com
 // @connect      mshibanami.github.io
 // ==/UserScript==
@@ -1330,4 +1331,80 @@
     document.addEventListener('turbo:load', watchStarredLists);
     watchTabSwitches();
   }
+
+
+  /* ============================================================
+     GITHUB CONTRIBUTION LINE GRAPH
+     ============================================================ */
+  const CONTRIBUTION_GRAPH = { enabled: true };
+
+  function renderContributionLineGraph() {
+    if (!CONTRIBUTION_GRAPH.enabled) return;
+    const days = document.querySelectorAll('.ContributionCalendar-day[data-date]');
+    if (!days.length) return;
+    if (document.getElementById('x-contribution-linegraph')) return;
+
+    const labels = [];
+    const data = [];
+    days.forEach((el) => {
+      if (labels.length >= 28) { labels.shift(); data.shift(); }
+      labels.push(el.getAttribute('data-date'));
+      const tipId = el.getAttribute('aria-labelledby');
+      const tip = tipId ? document.getElementById(tipId) : null;
+      const text = tip ? tip.textContent : '';
+      const m = text.match(/(\d+)\s+contribution/);
+      data.push(m ? Number(m[1]) : 0);
+    });
+
+    const container = document.createElement('div');
+    container.id = 'x-contribution-linegraph';
+    container.style.marginTop = '12px';
+    container.innerHTML = '<canvas id="x-gclg" height="120"></canvas>';
+
+    const graph = document.querySelector('.js-yearly-contributions');
+    if (graph) graph.after(container);
+
+    const ctx = document.getElementById('x-gclg');
+    if (ctx && window.Chart) {
+      new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Contributions',
+            data,
+            fill: false,
+            tension: 0.4,
+            borderColor: '#8b5cf6',
+            backgroundColor: '#8b5cf6',
+            pointRadius: 2,
+            spanGaps: true,
+          }],
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: { x: { display: false } },
+        },
+      });
+    }
+  }
+
+  function watchContributionGraph() {
+    if (!CONTRIBUTION_GRAPH.enabled) return;
+    renderContributionLineGraph();
+    const obs = new MutationObserver(() => renderContributionLineGraph());
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+    setTimeout(() => obs.disconnect(), 15000);
+  }
+
+  if (CONTRIBUTION_GRAPH.enabled) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', watchContributionGraph);
+    } else {
+      watchContributionGraph();
+    }
+    document.addEventListener('turbo:load', watchContributionGraph);
+  }
+
 })();
